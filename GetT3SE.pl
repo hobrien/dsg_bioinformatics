@@ -2,7 +2,7 @@
 
 =head1 NAME
 
-GetT3SE.pl version 1, 26 June 2012
+GetT3SE.pl version 1.1, 26 June 2012
 
 =head1 SYNOPSIS
 
@@ -24,6 +24,29 @@ Options:
     -p password for db (will prompt for one if it is not specified).
 
 =head2 NOTES
+
+Version 1.1 (26 June 2012): Adding a subfunction to compare existing features to those inferred by
+blast
+
+The following problems were encountered when running this on the DC T3SEs:
+-parts of the same T3SE separated by IS element (would also be caused by contig breaks)
+	-solution: label parts as 5' / 3' rather than -1 /-2
+-ends of genes often misaligned by blast, resulting in hits that extend slightly past the stop codon
+	-solution: subtract arbitrarily small amount from hit end before looking for start
+-frameshifs causing no-overlapping hits
+	-solution: group hit's that are within a few bp of eachother
+-if the codon before the start is also a start, the script picks it.
+	-solution: this is clearly a problem with the logic in the FindStart subroutine
+-discrepencies in the start codon between reference sequences
+	-solution: look for RBS
+-T3SE overlaps other ORF by greater than 50 bp
+	-solution: allow larger overlap (maybe proportional to size to eliminate small ORFs).
+-start and end of ref hit contig, but similarity is too low in middle. Script correctly predicts
+ORF, but end up with 2 predictions for the same gene
+	-solution: this will sort itself out when adding the annotations because the 1st copy will be
+	deleted when the second is added. However, the start is incorrect for one of them, so if it gets
+	added second, the result will be a mistake. This could be solved by adding the one closest to
+	the start second.
 
 It will be easy to add functionality to do the blasting as part of the script
 
@@ -82,7 +105,7 @@ my $NAMESPACE = $strain;
 
 my $dsn = "$database:$host";
 
-warn "using '$dsn'\n";
+#warn "using '$dsn'\n";
 
 my $db = Bio::DB::SeqFeature::Store->
   new( -adaptor => $adaptor,
@@ -102,13 +125,14 @@ my $logname = $path . $name ."_log.txt";
 #my $strain_name = GetPhy(GetOriginal($NAMESPACE));
 print "Parsing blast hits...\n";
 my %t3se_homo = %{BinHits($blastIO)};
+CompareDB($db, \%t3se_homo);
 #foreach ( keys ( %t3se_homo ) ) { print "$_\n"; }
-print "Adding features to database...\n";
-UpdateDB($db, \%t3se_homo);
-print "Writing sequences to files...\n";
+#print "Adding features to database...\n";
+#UpdateDB($db, \%t3se_homo);
+#print "Writing sequences to files...\n";
 #WriteSeqs($strain, $db, \%t3se_homo);
-print  "Printing summary...\n";
-SeqSummary($db, $logname, \%t3se_homo);
+#print  "Printing summary...\n";
+#SeqSummary($db, $logname, \%t3se_homo);
 
 sub SeqSummary {
   my $db = shift;
@@ -253,6 +277,23 @@ sub GetPassword {
   return ($pass);
 }
 
+sub GetTag {
+  my $db = shift;
+  my %names;
+  foreach ( $db->get_features_by_type('gene') ){
+    my @load_ids = $_->each_tag_value('locus_tag');
+    if ( $load_ids[0] ) {
+      $load_ids[0] =~ /([^.]+)/;
+      $names{$1} = 1;
+    }
+  }
+  (keys ( %names))[0] =~ /(.*_)/;
+  my $prefix = $1;
+  my $x = 1;
+  while ( $names{$prefix . sprintf  "%04d", $x} ) { $x ++; }
+  return $prefix . sprintf  "%04d", $x;
+}
+
 sub FindEnd {
   my $contig = shift;
   my $hsp = shift;
@@ -273,56 +314,31 @@ sub FindEnd {
       $x -= 3;
     }
   }
-  print "End: $stop\n";
+  #print "End: $stop\n";
   return $stop;
-}
-
-sub GetTag {
-  my $db = shift;
-  my %names;
-  foreach ( $db->get_features_by_type('gene') ){
-    my @load_ids = $_->each_tag_value('locus_tag');
-    if ( $load_ids[0] ) {
-      $load_ids[0] =~ /([^.]+)/;
-      $names{$1} = 1;
-    }
-  }
-  (keys ( %names))[0] =~ /(.*_)/;
-  my $prefix = $1;
-  my $x = 1;
-  while ( $names{$prefix . sprintf  "%04d", $x} ) { $x ++; }
-  return $prefix . sprintf  "%04d", $x;
 }
 
 sub FindStart {
   my $contig = shift;
   my $hsp = shift;
   my $start;
-  if ( $hsp->hit->strand == 1 ) {
-    my $x = $hsp->hit->start;
-    my $target_start = $x - ($hsp->query->start * 3) + 1;
-    print "Target Start: $x - (", $hsp->query->start, " * 3) + 1, = $target_start\n";
-    while ($x > 1 ) {
-      if ( substr($contig, $x-1, 3) =~ /(TAA)|(TAG)|(TGA)|(NNN)/ ) { last; }
-      if ( substr($contig, $x-1, 3) =~ /(AT[ACGT])|([CGT]TG)/ ) {
-        unless ($start and abs($x - $target_start) > abs($start - $target_start ) ) { $start = $x; }
-      }
-      $x -=3;
-    }
+  my $x = $hsp->hit->start;
+  unless ( $hsp->hit->strand == 1 ) {
+    $contig = RevCom($contig);
+    $x = length($contig) - $hsp->hit->end + 1;
   }
-  else {
-    my $x = $hsp->hit->end;
-    my $target_start = $x + ($hsp->query->start * 3) - 1;
-    print "Target Start: $x + (", $hsp->query->start, " * 3) - 1, = $target_start\n";
-    while ($x < length($contig) ) {
-      if ( substr($contig, $x - 4, 3) =~ /(ATT)|(CTA)|(TCA)|(NNN)/ ) { last; }
-      if ( substr($contig, $x - 4, 3) =~ /([ACGT]AT)|(CA[ACGT])/ ) {
-        unless ($start and abs($x - $target_start) > abs($start - $target_start ) ) { $start = $x; }
-      }
-      $x -=3;
+  my $target_start = $x - ($hsp->query->start * 3) + 1;
+  while ($x > 1 ) {
+    my $codon = substr($contig, $x-1, 3);
+    if ( $codon =~ /(TAA)|(TAG)|(TGA)|(NNN)/ ) { last; }
+    if ( $codon =~ /(AT[ACGT])|([CGT]TG)/ ) {
+      unless ($start and abs($x - $target_start) > abs($start - $target_start ) ) { $start = $x; }
     }
+    $x -=3;
   }
-  print "Start: $start\n";
+  if ( $start ) {
+    unless ( $hsp->hit->strand == 1 ) { $start = length($contig) - $start + 1; }
+  }
   return $start;
 }
 
@@ -375,10 +391,15 @@ sub GetRange {
 sub GetOverlap {
   my $feature = shift;
   my $hsp = shift;
+  my $overlap;
 #  print "HSP Loaction: ", $hsp->hit->location, "\n";
 #  print "Feature Loaction: ", $feature->location, "\n";
-  (my $start, my $stop, my $strand) = $hsp->hit->location->intersection($feature->location);
-  return abs($start -$stop);
+#  (my $start, my $stop, my $strand) = $hsp->hit->location->intersection($feature->location);
+  my @feature_coords = sort($feature->start, $feature->end);
+  my @hsp_coords = sort($hsp->hit->start, $hsp->hit->end);
+  $overlap = min($hsp_coords[1] - $hsp_coords[0], $hsp_coords[1] - $feature_coords[0], $feature_coords[1] - $hsp_coords[0], $feature_coords[1] - $feature_coords[0]);
+  if ( $overlap < 0 ) { $overlap = 0; }
+  return $overlap;
 #  if ( $feature->strand != $hsp->hit->strand ) { $overlap = 'wrong strand'; }
 #  elsif ( ($feature->start - $hsp->hit->start) % 3 ) { $overlap = 'wrong frame'; }
 #  elsif ( ${GetDif($feature, $hsp)}[1] < 0 ) { $overlap = "truncation"; }
@@ -498,7 +519,51 @@ sub WriteSeqs {
   }
 }
 
-sub UpdateDB { #identify gene and CDS features in Database corresponding to blast hits and add aliases
+sub CompareDB { #compare existing features to those already in the database.
+  my $db = shift;
+  my $hash_ref = shift;
+  my %t3se_homo = %{$hash_ref};
+  print "Feature_name\tDB_name\tstart_similarity\tend_similarity\n";
+  foreach my $t3se ( sort ( keys %t3se_homo ) ) {
+    my $hsp = $t3se_homo{$t3se};
+    my $gene;
+    my @locus_tags;
+    my $contig = $db->fetch_sequence($hsp->hit->location->seq_id);
+    my $start = FindStart($contig, $hsp);
+    unless ( $start ) { print "$t3se\tNO START\n"; next; }
+    my $end = FindEnd($contig, $hsp);
+    unless ( $end ) { print "$t3se\tNO END\n"; next; }
+    if ( $start > $end ) { ($start, $end) = ($end,$start); }
+    my $cds = substr($contig, $start, $end - $start + 1);
+    unless ( $hsp->hit->strand == 1 ) {  $cds = RevCom($cds); }
+    unless ( CheckORF($cds, $t3se) ) { $t3se = 'pseudo_' . $t3se; }
+    my $match = 0;
+    foreach ( $db->get_features_by_location($hsp->hit->location->seq_id, $start, $end) ) {
+      unless ( $_->type =~ /gene/i ) { next; }
+      unless ( GetOverlap($_, $hsp) > 50 ) { next; }
+      my $name = ($_->get_tagset_values('Alias'), $_->get_tagset_values('locus_tag'), $_->get_tagset_values('load_id'))[0];
+      if ($_->strand != $hsp->hit->strand or ($_->start - $hsp->hit->start) % 3 ) {
+        print "$t3se\t", $name, "\tWRONG FRAME\tWRONG FRAME\t\n";
+        $match ++;
+        next;
+      }
+      my @ends = ($_->start - $start, $end - $_->end);
+      unless ( $hsp->hit->strand == 1) { @ends = reverse(@ends); }
+      print "$t3se\t", $name, "\t";
+      foreach ( @ends ) {
+        if ( $_ > 0 ) { print '+', $_, "\t"; }
+        elsif ( $_ < 0 ) { print $_, "\t"; }
+        else { print "identical\t"; }
+      }
+      print "\n";
+      $match ++;
+    }
+    unless ( $match ) { print "$t3se\tNONE\tNA\tNA\t\n"; }
+  }
+}
+
+
+sub UpdateDB { #Remove features overlapping blast hits and add new features
   my $db = shift;
   my $hash_ref = shift;
   my %t3se_homo = %{$hash_ref};
