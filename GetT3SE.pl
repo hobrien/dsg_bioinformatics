@@ -2,7 +2,7 @@
 
 =head1 NAME
 
-GetT3SE.pl version 1.1, 26 June 2012
+GetT3SE.pl version 1.2, 27 June 2012
 
 =head1 SYNOPSIS
 
@@ -28,19 +28,22 @@ Options:
 Version 1.1 (26 June 2012): Adding a subfunction to compare existing features to those inferred by
 blast
 
-The following problems were encountered when running this on the DC T3SEs:
--parts of the same T3SE separated by IS element (would also be caused by contig breaks)
-	-solution: label parts as 5' / 3' rather than -1 /-2
+Version 1.2 (27 Jun 2012): The following problems were encountered when running this on the DC T3SEs:
 -ends of genes often misaligned by blast, resulting in hits that extend slightly past the stop codon
-	-solution: subtract arbitrarily small amount from hit end before looking for start
+	-solution: subtracted 21 bp from end of hit before looking for end
+-if the codon before the start is also a start, the script picks it.
+	-solution: fixed bug in the FindStart subroutine
+-T3SE overlaps other ORF by greater than 50 bp
+	-solution: allow larger overlap < 10% of length of ORF in db (still fails of ORF that overlaps hopS by 39%)
 -frameshifs causing no-overlapping hits
 	-solution: group hit's that are within a few bp of eachother
--if the codon before the start is also a start, the script picks it.
-	-solution: this is clearly a problem with the logic in the FindStart subroutine
+
+-if gene is a truncation mutant without a stop codon, there can be a lot of non-homologous sequence before real start
+	-solution: flag as chimeric if >XXX bp between blast hit end and stop codon.
+-parts of the same T3SE separated by IS element (would also be caused by contig breaks)
+	-solution: label parts as 5' / 3' rather than -1 /-2
 -discrepencies in the start codon between reference sequences
 	-solution: look for RBS
--T3SE overlaps other ORF by greater than 50 bp
-	-solution: allow larger overlap (maybe proportional to size to eliminate small ORFs).
 -start and end of ref hit contig, but similarity is too low in middle. Script correctly predicts
 ORF, but end up with 2 predictions for the same gene
 	-solution: this will sort itself out when adding the annotations because the 1st copy will be
@@ -298,23 +301,20 @@ sub FindEnd {
   my $contig = shift;
   my $hsp = shift;
   my $stop;
-  if ( $hsp->hit->strand == 1 ) {
-    my $x = $hsp->hit->end;
-    while ($x < length($contig) ) {
-      if ( substr($contig, $x - 3, 3) =~ /(TAA)|(TAG)|(TGA)/ ) { $stop = $x; last; }
-      if ( substr($contig, $x - 3, 3) =~ /NNN/ ) { last; }
-      $x +=3;
-    }
+  my $x = $hsp->hit->end;
+  unless ( $hsp->hit->strand == 1 ) {
+    $contig = RevCom($contig);
+    $x = length($contig) - $hsp->hit->start + 1;
   }
-  else {
-    my $x = $hsp->hit->start;
-    while ($x > 2 ) {
-      if ( substr($contig, $x-1, 3) =~ /(TTA)|(CTA)|(TCA)/ ) { $stop = $x; last; }
-      if ( substr($contig, $x-1, 3) =~ /NNN/ ) { last; }
-      $x -= 3;
-    }
+  $x -=21;
+  while ($x < length($contig) ) {
+    if ( substr($contig, $x - 3, 3) =~ /(TAA)|(TAG)|(TGA)/ ) { $stop = $x; last; }
+    if ( substr($contig, $x - 3, 3) =~ /NNN/ ) { last; }
+    $x +=3;
   }
-  #print "End: $stop\n";
+  if ( $stop ) {
+    unless ( $hsp->hit->strand == 1 ) { $stop = length($contig) - $stop + 1; }
+  }
   return $stop;
 }
 
@@ -327,7 +327,7 @@ sub FindStart {
     $contig = RevCom($contig);
     $x = length($contig) - $hsp->hit->end + 1;
   }
-  my $target_start = $x - ($hsp->query->start * 3) + 1;
+  my $target_start = $x - ($hsp->query->start * 3) + 3;
   while ($x > 1 ) {
     my $codon = substr($contig, $x-1, 3);
     if ( $codon =~ /(TAA)|(TAG)|(TGA)|(NNN)/ ) { last; }
@@ -419,7 +419,10 @@ sub BinHits {
       my $print = 1;
       my $x = 0;
       while ($x < @contig) {
-        if ( $hsp->hit->location->overlaps($contig[$x]->hit->location)) {  #if hsps overlap
+        if ( $hsp->hit->location->overlaps($contig[$x]->hit->location)
+             or abs($hsp->hit->start - $contig[$x]->hit->end) < 10
+             or abs($hsp->hit->end - $contig[$x]->hit->start) < 10
+        ) {  #if hsps overlap
           if ( $hsp->bits < $contig[$x]->bits ) {	                     #if new hsp has higher score than current one (discard current result)
             $contig[$x] = AdjustRange($contig[$x], $hsp);
             $print = 0;    #do not print result
@@ -540,13 +543,14 @@ sub CompareDB { #compare existing features to those already in the database.
     my $match = 0;
     foreach ( $db->get_features_by_location($hsp->hit->location->seq_id, $start, $end) ) {
       unless ( $_->type =~ /gene/i ) { next; }
-      unless ( GetOverlap($_, $hsp) > 50 ) { next; }
+      #print GetOverlap($_, $hsp), " / ", $_->length, " = ", GetOverlap($_, $hsp)/$_->length, "\n";
+      unless ( GetOverlap($_, $hsp)/$_->length > 0.1 ) { next; }
       my $name = ($_->get_tagset_values('Alias'), $_->get_tagset_values('locus_tag'), $_->get_tagset_values('load_id'))[0];
-      if ($_->strand != $hsp->hit->strand or ($_->start - $hsp->hit->start) % 3 ) {
-        print "$t3se\t", $name, "\tWRONG FRAME\tWRONG FRAME\t\n";
-        $match ++;
-        next;
-      }
+#      if ($_->strand != $hsp->hit->strand or ($_->start - $hsp->hit->start) % 3 ) {
+#        print "$t3se\t", $name, "\tWRONG FRAME\tWRONG FRAME\t\n";
+#        $match ++;
+#        next;
+#      }
       my @ends = ($_->start - $start, $end - $_->end);
       unless ( $hsp->hit->strand == 1) { @ends = reverse(@ends); }
       print "$t3se\t", $name, "\t";
@@ -575,11 +579,9 @@ sub UpdateDB { #Remove features overlapping blast hits and add new features
     my $location = $hsp->hit->location->seq_id . ", " . join('-',$hsp->range('hit'));
     #print "looking for features\n";
     foreach ( $db->get_features_by_location($hsp->hit->location->seq_id, $hsp->range('hit'))) {
-      print GetOverlap($_, $hsp), " > 50\n";
-      if ( GetOverlap($_, $hsp) > 50 ) {
-        @locus_tags = (@locus_tags, $_->get_tagset_values('locus_tag'));
-        if ( $_->type =~ /gene/i or $_->type =~ /CDS/i ) {$db->delete(($_)); }
-      }
+      unless ( GetOverlap($_, $hsp)/$_->length > 0.1 ) { next; }
+      @locus_tags = (@locus_tags, $_->get_tagset_values('locus_tag'));
+      if ( $_->type =~ /gene/i or $_->type =~ /CDS/i ) {$db->delete(($_)); }
     }
     my $locus_tag;
     if ( @locus_tags ) { $locus_tag = $locus_tags[0]; print "$locus_tag\n"; }
